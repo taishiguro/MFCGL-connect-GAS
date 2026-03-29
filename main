@@ -1,0 +1,623 @@
+// ============================================================
+// MFC会計 × Googleスプレッドシート API連携スクリプト
+// 対象製品  : マネーフォワード クラウド会計
+// 作成者    : Growth Farm合同会社
+// 参照仕様  : openapi.yaml (CA PUBLIC REST API v3.0.0)
+// 最終更新  : 2026-03-27
+// 更新内容  : 会計期間をまたぐ日付範囲に対応（期間ごとにリクエスト分割）
+//             勘定科目マスタ取得機能を追加
+//
+// 【前提】
+//   - OAuth2.gs を別ファイルとして同プロジェクトに組み込むこと
+//     (ライブラリ追加は V8 ランタイムと相性が悪いため使用しない)
+//     取得元: https://github.com/googleworkspace/apps-script-oauth2/blob/main/dist/OAuth2.gs
+//
+// 【スクリプトプロパティ設定】
+//   CLIENT_ID     : アプリポータルで発行した Client ID
+//   CLIENT_SECRET : アプリポータルで発行した Client Secret
+//   SCOPE         : mfc/accounting/offices.read mfc/accounting/journal.read mfc/accounting/accounts.read
+//
+// 【アプリポータル設定】
+//   リダイレクト URI: https://script.google.com/macros/d/【スクリプトID】/usercallback
+//   クライアント認証方式: CLIENT_SECRET_BASIC
+//
+// 【マスタシート構成】
+//   C3 : 取得開始日（例: 2025/04/01）
+//   C4 : 取得終了日（空の場合は今日）
+// ============================================================
+
+
+// ============================================================
+// ① 定数定義（openapi.yaml servers / securitySchemes より確定）
+// ============================================================
+
+// 認証エンドポイント（openapi.yaml securitySchemes.OAuth2.flows.authorizationCode より）
+const MFC_AUTH_BASE_URL = 'https://api.biz.moneyforward.com/authorize';
+const MFC_TOKEN_URL     = 'https://api.biz.moneyforward.com/token';
+
+// APIベースURL（openapi.yaml servers.url より）＋バージョンパス
+const MFC_API_BASE_URL  = 'https://api-accounting.moneyforward.com/api/v3';
+
+// シート名
+const OFFICE_SHEET_NAME   = '事業者情報';
+const ACCOUNTS_SHEET_NAME = '勘定科目マスタ';
+const JOURNAL_SHEET_NAME  = '仕訳データ';
+
+// ヘッダー行（openapi.yaml Office / AccountingPeriod スキーマより）
+const OFFICE_HEADER = [[
+  '事業者名', '事業者コード', '種別',
+  '会計期間_開始日', '会計期間_終了日', '会計年度'
+]];
+
+// ヘッダー行（openapi.yaml Account / SubAccount スキーマより）
+// GET /api/v3/accounts は sub_accounts を内包して返却する
+const ACCOUNTS_HEADER = [[
+  '勘定科目ID', '勘定科目名', '財務諸表区分', '勘定科目グループ', 'カテゴリ',
+  '有効', '税区分ID', '検索キー',
+  '補助科目ID', '補助科目名', '補助科目_税区分ID', '補助科目_検索キー'
+]];
+
+// ヘッダー行（openapi.yaml JournalItem / JournalLine / JournalLineDetails スキーマより）
+const JOURNAL_HEADER = [[
+  '仕訳ID', '仕訳番号', '会計年度', '取引日', '仕訳種別', '作成経路',
+  '借方科目名', '借方金額', '借方消費税額', '借方補助科目',
+  '借方部門名', '借方取引先名', '借方インボイス区分',
+  '貸方科目名', '貸方金額', '貸方消費税額', '貸方補助科目',
+  '貸方部門名', '貸方取引先名', '貸方インボイス区分',
+  '摘要', 'メモ', '作成日時', '更新日時'
+]];
+
+
+// ============================================================
+// ② メニュー追加
+// ============================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('MFC会計連携')
+    .addItem('0. 事業者情報を確認',    'fetchAndWriteOfficeInfo')
+    .addItem('1. 勘定科目マスタを取得', 'fetchAndWriteAccounts')
+    .addItem('2. 仕訳データを取得',    'fetchAndWriteJournals')
+    .addSeparator()
+    .addItem('認証を実行',   'showAuthorizationUrl')
+    .addItem('認証をリセット', 'reset')
+    .addToUi();
+}
+
+
+// ============================================================
+// ③ OAuth2 サービス設定
+//    ※ OAuth2.gs を同プロジェクトに組み込んでいることが前提
+// ============================================================
+
+function getMoneyForwardAccountingService() {
+  const props         = PropertiesService.getScriptProperties();
+  const CLIENT_ID     = props.getProperty('CLIENT_ID');
+  const CLIENT_SECRET = props.getProperty('CLIENT_SECRET');
+  const SCOPE         = props.getProperty('SCOPE');
+
+  Logger.log('--- getMoneyForwardAccountingService ---');
+  Logger.log('CLIENT_ID: ' + CLIENT_ID);
+  Logger.log('SCOPE: '     + SCOPE);
+
+  if (!CLIENT_ID || !CLIENT_SECRET || !SCOPE) {
+    SpreadsheetApp.getUi().alert(
+      'スクリプトプロパティが未設定です。\n'
+      + '「CLIENT_ID」「CLIENT_SECRET」「SCOPE」の3つを設定してください。'
+    );
+    throw new Error('スクリプトプロパティに CLIENT_ID / CLIENT_SECRET / SCOPE を設定してください。');
+  }
+
+  return OAuth2.createService('mfc_accounting')
+    .setAuthorizationBaseUrl(MFC_AUTH_BASE_URL)
+    .setTokenUrl(MFC_TOKEN_URL)
+    .setClientId(CLIENT_ID)
+    .setClientSecret(CLIENT_SECRET)
+    .setCallbackFunction('usercallback')
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope(SCOPE)
+    .setClientAuthentication(OAuth2.ClientIdentification.CLIENT_SECRET_BASIC);
+}
+
+// 認証URLをダイアログで表示
+function showAuthorizationUrl() {
+  const service          = getMoneyForwardAccountingService();
+  const authorizationUrl = service.getAuthorizationUrl();
+  Logger.log('Authorization URL: ' + authorizationUrl);
+
+  const html = HtmlService.createHtmlOutput(
+    `<p>以下のURLを開いて認証を許可してください:</p>
+     <p><a href="${authorizationUrl}" target="_blank"
+         style="word-break:break-all;">${authorizationUrl}</a></p>`
+  ).setWidth(450).setHeight(150);
+
+  SpreadsheetApp.getUi().showModalDialog(html, '認証が必要です');
+}
+
+// 認証後コールバック（関数名は setCallbackFunction と一致させること）
+function usercallback(request) {
+  Logger.log('--- usercallback received ---');
+  Logger.log('Request Parameters: ' + JSON.stringify(request.parameter, null, 2));
+
+  const service = getMoneyForwardAccountingService();
+  let authorized = false;
+  try {
+    authorized = service.handleCallback(request);
+  } catch (e) {
+    Logger.log('Error in usercallback: ' + e.toString());
+  }
+
+  if (authorized) {
+    Logger.log('Authentication successful.');
+    return HtmlService.createHtmlOutput(
+      '認証に成功しました。このタブを閉じてスプレッドシートに戻ってください。'
+    );
+  } else {
+    Logger.log('Authentication failed.');
+    return HtmlService.createHtmlOutput(
+      '認証に失敗しました。詳細はログを確認してください。'
+    );
+  }
+}
+
+// 認証リセット
+function reset() {
+  try {
+    getMoneyForwardAccountingService().reset();
+    SpreadsheetApp.getUi().alert('認証をリセットしました。');
+    Logger.log('Service reset successfully.');
+  } catch (e) {
+    Logger.log('Error on reset: ' + e.toString());
+    SpreadsheetApp.getUi().alert('リセット中にエラーが発生しました: ' + e.toString());
+  }
+}
+
+
+// ============================================================
+// ④ ユーティリティ関数
+// ============================================================
+
+/**
+ * Date オブジェクトを YYYY-MM-DD 文字列に変換する
+ * スプレッドシートから取得した値は Date 型で返るため必ず変換する
+ */
+function formatDate_(date) {
+  if (!(date instanceof Date) || isNaN(date)) return null;
+  const y = date.getFullYear();
+  const m = ('00' + (date.getMonth() + 1)).slice(-2);
+  const d = ('00' + date.getDate()).slice(-2);
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * null / undefined のとき空文字を返す安全な値取得
+ * ※ value || '' はゼロ(0)を空文字にしてしまうため使用しない
+ */
+function safeNum_(val) {
+  return (val !== null && val !== undefined) ? val : '';
+}
+
+/**
+ * APIリクエスト共通処理
+ * @param {string} url         リクエストURL
+ * @param {string} accessToken Bearer トークン
+ * @returns {Object}           パース済みレスポンスオブジェクト
+ * @throws エラーレスポンス時は Error をスロー
+ */
+function fetchApi_(url, accessToken) {
+  Logger.log('[API Request] ' + url);
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + accessToken,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  });
+
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+  Logger.log('[Response Code] ' + responseCode);
+
+  if (responseCode === 429) {
+    throw new Error('レートリミットに達しました（429）。しばらく待ってから再実行してください。');
+  }
+  if (responseCode === 401) {
+    throw new Error('アクセストークンが無効または失効しています（401）。認証をリセットして再認証してください。');
+  }
+  if (responseCode === 403) {
+    throw new Error('権限がありません（403）。スコープの設定を確認してください。');
+  }
+  if (responseCode !== 200) {
+    Logger.log('[Error Response] ' + responseText);
+    throw new Error(`APIリクエストに失敗しました（HTTP ${responseCode}）。ログを確認してください。`);
+  }
+
+  return JSON.parse(responseText);
+}
+
+/**
+ * シートを取得または新規作成して返す
+ */
+function getOrCreateSheet_(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  return ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+}
+
+
+// ============================================================
+// ⑤ 事業者情報の取得と書き込み
+//    エンドポイント: GET /api/v3/offices
+//    スコープ      : mfc/accounting/offices.read
+//    openapi.yaml  : Office / AccountingPeriod スキーマ参照
+// ============================================================
+
+function fetchAndWriteOfficeInfo() {
+  const service = getMoneyForwardAccountingService();
+  if (!service.hasAccess()) {
+    showAuthorizationUrl();
+    return;
+  }
+
+  let office;
+  try {
+    office = fetchApi_(`${MFC_API_BASE_URL}/offices`, service.getAccessToken());
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('事業者情報の取得に失敗しました。\n' + e.message);
+    return;
+  }
+
+  Logger.log('[Office] ' + JSON.stringify(office, null, 2));
+
+  // 会計期間一覧をダイアログで表示
+  const periods = (office.accounting_periods || [])
+    .map(p => `  FY${p.fiscal_year}: ${p.start_date} 〜 ${p.end_date}`)
+    .join('\n');
+
+  SpreadsheetApp.getUi().alert(
+    `【事業者情報】\n`
+    + `名称  : ${office.name}\n`
+    + `コード: ${office.code}\n`
+    + `種別  : ${office.type}\n\n`
+    + `【会計期間】\n${periods}`
+  );
+
+  // シートへの書き込み
+  const sheet = getOrCreateSheet_(OFFICE_SHEET_NAME);
+  sheet.clear();
+  sheet.getRange(1, 1, 1, OFFICE_HEADER[0].length).setValues(OFFICE_HEADER);
+
+  const rows = (office.accounting_periods || []).map(p => [
+    office.name  || '',
+    office.code  || '',
+    office.type  || '',
+    p.start_date || '',
+    p.end_date   || '',
+    safeNum_(p.fiscal_year)
+  ]);
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  Logger.log(`[Office] ${rows.length} 件の会計期間をシートに書き込みました。`);
+}
+
+
+// ============================================================
+// ⑥ 勘定科目マスタの取得と書き込み
+//    エンドポイント: GET /api/v3/accounts
+//    スコープ      : mfc/accounting/accounts.read
+//    openapi.yaml  : AccountResponse / Account / SubAccount スキーマ参照
+//
+//    レスポンス構造:
+//      accounts[]                     勘定科目の配列
+//        .id                          勘定科目ID
+//        .name                        勘定科目名
+//        .financial_statement_type    財務諸表区分（BALANCE_SHEET / PROFIT_LOSS 等）
+//        .account_group               勘定科目グループ（ASSET / LIABILITY / CAPITAL 等）
+//        .category                    カテゴリ（CASH_AND_DEPOSITS 等）
+//        .available                   有効フラグ
+//        .tax_id                      税区分ID
+//        .search_key                  検索キー
+//        .sub_accounts[]              補助科目の配列（勘定科目に内包）
+//          .id                        補助科目ID
+//          .name                      補助科目名
+//          .tax_id                    税区分ID
+//          .search_key                検索キー
+//
+//    補助科目がある勘定科目 → 補助科目数分の行に展開して出力
+//    補助科目がない勘定科目 → 補助科目列を空欄にして1行出力
+// ============================================================
+
+function fetchAndWriteAccounts() {
+  const service = getMoneyForwardAccountingService();
+  if (!service.hasAccess()) {
+    showAuthorizationUrl();
+    return;
+  }
+
+  // available=true を指定して有効な勘定科目のみ取得
+  // クエリパラメータを省略すると無効科目も含む全件が返却される
+  const url = `${MFC_API_BASE_URL}/accounts?available=true`;
+
+  let result;
+  try {
+    result = fetchApi_(url, service.getAccessToken());
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('勘定科目マスタの取得に失敗しました。\n' + e.message);
+    return;
+  }
+
+  Logger.log('[Accounts] Response keys: ' + JSON.stringify(Object.keys(result)));
+
+  // openapi.yaml AccountResponse スキーマ: { accounts: Account[] }
+  const accounts = result.accounts || [];
+
+  Logger.log(`[Accounts] 取得勘定科目数: ${accounts.length}`);
+
+  if (accounts.length === 0) {
+    SpreadsheetApp.getUi().alert('勘定科目が見つかりませんでした。');
+    return;
+  }
+
+  // シートへの書き込み
+  const sheet = getOrCreateSheet_(ACCOUNTS_SHEET_NAME);
+  sheet.clear();
+  sheet.getRange(1, 1, 1, ACCOUNTS_HEADER[0].length).setValues(ACCOUNTS_HEADER);
+
+  // 補助科目がある場合は補助科目数分の行に展開する
+  // 補助科目がない場合は補助科目列を空欄にして1行出力する
+  const rows = accounts.flatMap(account => {
+    const subAccounts = account.sub_accounts || [];
+
+    if (subAccounts.length === 0) {
+      // 補助科目なし：勘定科目のみ1行出力
+      return [[
+        account.id                       || '',  // 勘定科目ID
+        account.name                     || '',  // 勘定科目名
+        account.financial_statement_type || '',  // 財務諸表区分
+        account.account_group            || '',  // 勘定科目グループ
+        account.category                 || '',  // カテゴリ
+        String(account.available),               // 有効（true / false）
+        account.tax_id                   || '',  // 税区分ID
+        account.search_key               || '',  // 検索キー
+        '',  // 補助科目ID（なし）
+        '',  // 補助科目名（なし）
+        '',  // 補助科目_税区分ID（なし）
+        ''   // 補助科目_検索キー（なし）
+      ]];
+    }
+
+    // 補助科目あり：補助科目数分の行に展開
+    return subAccounts.map(sub => [
+      account.id                       || '',  // 勘定科目ID
+      account.name                     || '',  // 勘定科目名
+      account.financial_statement_type || '',  // 財務諸表区分
+      account.account_group            || '',  // 勘定科目グループ
+      account.category                 || '',  // カテゴリ
+      String(account.available),               // 有効（true / false）
+      account.tax_id                   || '',  // 税区分ID
+      account.search_key               || '',  // 検索キー
+      sub.id                           || '',  // 補助科目ID
+      sub.name                         || '',  // 補助科目名
+      sub.tax_id                       || '',  // 補助科目_税区分ID
+      sub.search_key                   || ''   // 補助科目_検索キー
+    ]);
+  });
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  SpreadsheetApp.getUi().alert(
+    `勘定科目マスタを取得しました。\n`
+    + `勘定科目数: ${accounts.length} 件\n`
+    + `出力行数（補助科目展開後）: ${rows.length} 行`
+  );
+  Logger.log(`[Accounts] ${rows.length} 行を書き込みました。`);
+}
+
+
+// ============================================================
+// ⑦ 仕訳データの取得と書き込み
+//    エンドポイント: GET /api/v3/journals
+//    スコープ      : mfc/accounting/journal.read
+//    openapi.yaml  : GetJournalsResponse / JournalItem /
+//                    JournalLine / JournalLineDetails スキーマ参照
+//
+//    【重要】
+//    1リクエストで指定できる日付範囲は単一の会計期間内に限られる
+//    （openapi.yaml JournalError "Given date is not matching any accounting periods."）
+//    そのため以下の手順で処理する：
+//      ① GET /api/v3/offices で会計期間一覧を取得
+//      ② マスタ指定期間と重複する会計期間を抽出
+//      ③ 会計期間ごとにリクエストを分割して仕訳を取得
+//      ④ 全期間分をまとめてシートに書き込む
+// ============================================================
+
+function fetchAndWriteJournals() {
+  const service = getMoneyForwardAccountingService();
+  if (!service.hasAccess()) {
+    showAuthorizationUrl();
+    return;
+  }
+
+  // マスタシートから取得期間を取得（OFFICE_ID は MFC会計APIでは不要）
+  let masterFromDate, masterToDate;
+  try {
+    const masterSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('マスタ');
+    if (!masterSheet) throw new Error('「マスタ」シートが見つかりません。');
+
+    const fromDateVal = masterSheet.getRange('C3').getValue();
+    if (!fromDateVal) throw new Error('C3セルが空です。取得開始日を入力してください。');
+    masterFromDate = formatDate_(new Date(fromDateVal));
+    if (!masterFromDate) throw new Error('C3セルの日付形式が正しくありません。');
+
+    const toDateVal = masterSheet.getRange('C4').getValue();
+    masterToDate = toDateVal ? formatDate_(new Date(toDateVal)) : formatDate_(new Date());
+
+  } catch (e) {
+    SpreadsheetApp.getUi().alert(`パラメータ取得エラー: ${e.message}`);
+    return;
+  }
+
+  Logger.log(`[Journals] マスタ指定期間: ${masterFromDate} 〜 ${masterToDate}`);
+
+  const accessToken = service.getAccessToken();
+
+  // ① 会計期間一覧を取得
+  let office;
+  try {
+    office = fetchApi_(`${MFC_API_BASE_URL}/offices`, accessToken);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('会計期間の取得に失敗しました。\n' + e.message);
+    return;
+  }
+
+  const accountingPeriods = office.accounting_periods || [];
+  if (accountingPeriods.length === 0) {
+    SpreadsheetApp.getUi().alert('会計期間が取得できませんでした。');
+    return;
+  }
+
+  Logger.log(`[Journals] 全会計期間数: ${accountingPeriods.length}`);
+
+  // ② マスタ指定期間と重複する会計期間のみに絞り込む
+  //    会計期間はAPIから降順で返却される（openapi.yaml offices エンドポイント説明より）
+  const targetPeriods = accountingPeriods.filter(p => {
+    return p.start_date <= masterToDate && p.end_date >= masterFromDate;
+  });
+
+  Logger.log(`[Journals] 対象会計期間数: ${targetPeriods.length}`);
+  targetPeriods.forEach(p =>
+    Logger.log(`[Journals]   FY${p.fiscal_year}: ${p.start_date} 〜 ${p.end_date}`)
+  );
+
+  if (targetPeriods.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      '指定期間に該当する会計期間が見つかりませんでした。\n'
+      + '先に「0. 事業者情報を確認」で会計期間を確認してください。'
+    );
+    return;
+  }
+
+  // ③ 会計期間ごとにリクエストを分割して仕訳を取得
+  const allJournals = [];
+
+  for (const period of targetPeriods) {
+
+    // マスタ指定期間と会計期間の重複部分（より狭い範囲）を計算
+    const fromDate = masterFromDate > period.start_date ? masterFromDate : period.start_date;
+    const toDate   = masterToDate   < period.end_date   ? masterToDate   : period.end_date;
+
+    Logger.log(`[Journals] FY${period.fiscal_year} リクエスト期間: ${fromDate} 〜 ${toDate}`);
+
+    let page       = 1;
+    let totalPages = 1;
+
+    // ページネーションループ
+    // openapi.yaml: per_page 最大 10000、metadata.total_pages で全ページ数を管理
+    do {
+      const url = `${MFC_API_BASE_URL}/journals`
+        + `?start_date=${fromDate}&end_date=${toDate}&page=${page}&per_page=100`;
+
+      let result;
+      try {
+        result = fetchApi_(url, accessToken);
+      } catch (e) {
+        SpreadsheetApp.getUi().alert(
+          `仕訳取得エラー（FY${period.fiscal_year} ページ${page}）: ${e.message}`
+        );
+        return;
+      }
+
+      const journals = result.journals || [];
+      const metadata = result.metadata || {};
+      totalPages     = metadata.total_pages || 1;
+
+      allJournals.push(...journals);
+      Logger.log(
+        `[Journals] FY${period.fiscal_year} page ${page}/${totalPages}, 取得: ${journals.length}件`
+      );
+      page++;
+
+    } while (page <= totalPages);
+  }
+
+  Logger.log(`[Journals] 合計取得件数: ${allJournals.length}`);
+
+  if (allJournals.length === 0) {
+    SpreadsheetApp.getUi().alert('取得期間内に仕訳データが見つかりませんでした。');
+    return;
+  }
+
+  // ④ 全期間分をまとめてシートに書き込む
+  writeJournalsToSheet_(allJournals);
+}
+
+
+// ============================================================
+// ⑧ 仕訳データのシート書き込み
+//    branches（複数行仕訳）を flatMap で1明細行ずつ展開する
+//
+//    openapi.yaml JournalItem.branches[] = JournalLine[]
+//      JournalLine.debitor  = JournalLineDetails（借方）
+//      JournalLine.creditor = JournalLineDetails（貸方）
+// ============================================================
+
+function writeJournalsToSheet_(allJournals) {
+  const sheet = getOrCreateSheet_(JOURNAL_SHEET_NAME);
+  sheet.clear();
+  sheet.getRange(1, 1, 1, JOURNAL_HEADER[0].length).setValues(JOURNAL_HEADER);
+
+  // branches を1行ずつ展開（複数行仕訳に対応）
+  const rows = allJournals.flatMap(j => {
+    return (j.branches || []).map(branch => {
+      const deb = branch.debitor  || {};  // 借方
+      const cre = branch.creditor || {};  // 貸方
+
+      return [
+        j.id                   || '',   // 仕訳ID
+        safeNum_(j.number),             // 仕訳番号
+        safeNum_(j.term_period),        // 会計年度
+        j.transaction_date     || '',   // 取引日
+        j.journal_type         || '',   // journal_entry / adjusting_entry
+        j.entered_by           || '',   // 作成経路（JOURNAL_TYPE_NORMAL 等）
+
+        deb.account_name       || '',   // 借方科目名
+        safeNum_(deb.value),            // 借方金額
+        safeNum_(deb.tax_value),        // 借方消費税額
+        deb.sub_account_name   || '',   // 借方補助科目名
+        deb.department_name    || '',   // 借方部門名
+        deb.trade_partner_name || '',   // 借方取引先名
+        deb.invoice_kind       || '',   // 借方インボイス区分
+
+        cre.account_name       || '',   // 貸方科目名
+        safeNum_(cre.value),            // 貸方金額
+        safeNum_(cre.tax_value),        // 貸方消費税額
+        cre.sub_account_name   || '',   // 貸方補助科目名
+        cre.department_name    || '',   // 貸方部門名
+        cre.trade_partner_name || '',   // 貸方取引先名
+        cre.invoice_kind       || '',   // 貸方インボイス区分
+
+        branch.remark          || '',   // 摘要
+        j.memo                 || '',   // メモ
+        j.create_time ? j.create_time.substring(0, 10) : '',  // 作成日時
+        j.update_time ? j.update_time.substring(0, 10) : ''   // 更新日時
+      ];
+    });
+  });
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  SpreadsheetApp.getUi().alert(
+    `仕訳データを取得しました。\n`
+    + `仕訳件数: ${allJournals.length} 件\n`
+    + `明細行数（branches展開後）: ${rows.length} 行`
+  );
+  Logger.log(`[WriteSheet] ${rows.length} 行を書き込みました。`);
+}
