@@ -1,0 +1,246 @@
+/**
+ * @license
+ * Copyright 2011 Google Inc. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @fileoverview Description of this file.
+ */
+(function(global) {
+  var OAuth2 = (function() {
+    var TOKEN_PROPERTY_NAME_ = 'oauth2.token';
+    var SERVICE_NAME_PROPERTY_NAME_ = 'oauth2.serviceName';
+    var CALLBACK_FUNCTION_PROPERTY_NAME_ = 'oauth2.callback';
+
+    var AuthorizationState = {
+      NOT_AUTHORIZED: 'not_authorized',
+      EXPIRED: 'expired',
+      AUTHORIZED: 'authorized'
+    };
+
+    var ClientIdentification = {
+      CLIENT_SECRET_POST: 'client_secret_post',
+      CLIENT_SECRET_BASIC: 'client_secret_basic'
+    };
+
+    function createService(serviceName) {
+      return new Service(serviceName);
+    }
+
+    function Service(serviceName) {
+      this.serviceName_ = serviceName;
+      this.propertyStore_ = PropertiesService.getUserProperties();
+      this.token_ = null;
+      this.clientIdentification_ = ClientIdentification.CLIENT_SECRET_POST;
+    }
+
+    Service.prototype.setAuthorizationBaseUrl = function(authorizationBaseUrl) {
+      this.authorizationBaseUrl_ = authorizationBaseUrl;
+      return this;
+    };
+
+    Service.prototype.setTokenUrl = function(tokenUrl) {
+      this.tokenUrl_ = tokenUrl;
+      return this;
+    };
+
+    Service.prototype.setClientId = function(clientId) {
+      this.clientId_ = clientId;
+      return this;
+    };
+
+    Service.prototype.setClientSecret = function(clientSecret) {
+      this.clientSecret_ = clientSecret;
+      return this;
+    };
+
+    Service.prototype.setCallbackFunction = function(callbackFunctionName) {
+      this.callbackFunctionName_ = callbackFunctionName;
+      return this;
+    };
+
+    Service.prototype.setPropertyStore = function(propertyStore) {
+      this.propertyStore_ = propertyStore;
+      return this;
+    };
+
+    Service.prototype.setScope = function(scope) {
+      this.scope_ = scope;
+      return this;
+    };
+
+    Service.prototype.setClientAuthentication = function(clientIdentification) {
+      this.clientIdentification_ = clientIdentification;
+      return this;
+    };
+
+    Service.prototype.getAuthorizationUrl = function() {
+      var state = this.createState_();
+      var params = {
+        client_id: this.clientId_,
+        response_type: 'code',
+        redirect_uri: this.getRedirectUri_(),
+        scope: this.scope_,
+        state: state
+      };
+      return this.authorizationBaseUrl_ + '?' + this.toUrlQuery_(params);
+    };
+
+    Service.prototype.handleCallback = function(callbackRequest) {
+      var code = callbackRequest.parameter.code;
+      var error = callbackRequest.parameter.error;
+      if (error) {
+        throw 'Error authorizing token: ' + error;
+      }
+      var state = callbackRequest.parameter.state;
+      if (!this.verifyState_(state)) {
+        throw 'Error verifying state.';
+      }
+      this.propertyStore_.setProperty(SERVICE_NAME_PROPERTY_NAME_,
+          this.serviceName_);
+      this.propertyStore_.setProperty(CALLBACK_FUNCTION_PROPERTY_NAME_,
+          this.callbackFunctionName_);
+      this.exchangeCodeForToken_(code);
+      return true;
+    };
+
+    Service.prototype.getAccessToken = function() {
+      this.loadToken_();
+      if (!this.token_) {
+        throw 'No token found. You need to authorize first.';
+      }
+      if (this.isExpired_()) {
+        this.refresh();
+      }
+      return this.token_.access_token;
+    };
+
+    Service.prototype.reset = function() {
+      this.propertyStore_.deleteProperty(TOKEN_PROPERTY_NAME_);
+      this.propertyStore_.deleteProperty(SERVICE_NAME_PROPERTY_NAME_);
+      this.propertyStore_.deleteProperty(CALLBACK_FUNCTION_PROPERTY_NAME_);
+    };
+
+    Service.prototype.hasAccess = function() {
+      this.loadToken_();
+      if (!this.token_) {
+        return false;
+      }
+      if (this.isExpired_()) {
+        return false;
+      }
+      return true;
+    };
+
+    Service.prototype.refresh = function() {
+      this.loadToken_();
+      if (!this.token_ || !this.token_.refresh_token) {
+        throw 'No refresh token found. You need to authorize again.';
+      }
+      var params = {
+        grant_type: 'refresh_token',
+        refresh_token: this.token_.refresh_token
+      };
+      this.fetchToken_(params);
+    };
+
+    Service.prototype.getRedirectUri_ = function() {
+      var currentScriptId = ScriptApp.getScriptId();
+      return 'https://script.google.com/macros/d/' + currentScriptId +
+          '/usercallback';
+    };
+
+    Service.prototype.createState_ = function() {
+      var state = ScriptApp.newStateToken()
+          .withMethod(this.callbackFunctionName_)
+          .withTimeout(3600)
+          .createToken();
+      return state;
+    };
+
+    Service.prototype.verifyState_ = function(state) {
+      return true;
+    };
+
+    Service.prototype.exchangeCodeForToken_ = function(code) {
+      var params = {
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: this.getRedirectUri_()
+      };
+      this.fetchToken_(params);
+    };
+
+    Service.prototype.fetchToken_ = function(params) {
+      var headers = {};
+      if (this.clientIdentification_ == ClientIdentification.CLIENT_SECRET_BASIC) {
+        var auth = Utilities.base64Encode(this.clientId_ + ':' +
+            this.clientSecret_);
+        headers['Authorization'] = 'Basic ' + auth;
+      } else {
+        params.client_id = this.clientId_;
+        params.client_secret = this.clientSecret_;
+      }
+      
+      var response = UrlFetchApp.fetch(this.tokenUrl_, {
+        method: 'POST',
+        headers: headers,
+        payload: params,
+        muteHttpExceptions: true
+      });
+      var result = JSON.parse(response.getContentText());
+      if (response.getResponseCode() != 200) {
+        throw 'Error fetching token: ' + result.error;
+      }
+      this.token_ = result;
+      this.token_.granted_time = new Date().getTime();
+      this.saveToken_();
+    };
+
+    Service.prototype.loadToken_ = function() {
+      var tokenString = this.propertyStore_.getProperty(TOKEN_PROPERTY_NAME_);
+      if (tokenString) {
+        this.token_ = JSON.parse(tokenString);
+      }
+    };
+
+    Service.prototype.saveToken_ = function() {
+      var tokenString = JSON.stringify(this.token_);
+      this.propertyStore_.setProperty(TOKEN_PROPERTY_NAME_, tokenString);
+    };
+
+    Service.prototype.isExpired_ = function() {
+      return (new Date().getTime() - this.token_.granted_time) / 1000 >
+          this.token_.expires_in;
+    };
+
+    Service.prototype.toUrlQuery_ = function(params) {
+      var result = [];
+      for (var key in params) {
+        if (params.hasOwnProperty(key)) {
+          var value = params[key];
+          result.push(encodeURIComponent(key) + '=' + encodeURIComponent(value));
+        }
+      }
+      return result.join('&');
+    };
+
+    return {
+      createService: createService,
+      ClientIdentification: ClientIdentification
+    };
+  })();
+  global.OAuth2 = OAuth2;
+})(this);
