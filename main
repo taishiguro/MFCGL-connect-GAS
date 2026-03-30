@@ -3,9 +3,10 @@
 // 対象製品  : マネーフォワード クラウド会計
 // 作成者    : Growth Farm合同会社
 // 参照仕様  : openapi.yaml (CA PUBLIC REST API v3.0.0)
-// 最終更新  : 2026-03-27
+// 最終更新  : 2026-03-30
 // 更新内容  : 会計期間をまたぐ日付範囲に対応（期間ごとにリクエスト分割）
 //             勘定科目マスタ取得機能を追加
+//             損益計算書推移表取得機能を追加（GET /api/v3/reports/transition_pl）
 //
 // 【前提】
 //   - OAuth2.gs を別ファイルとして同プロジェクトに組み込むこと
@@ -15,7 +16,7 @@
 // 【スクリプトプロパティ設定】
 //   CLIENT_ID     : アプリポータルで発行した Client ID
 //   CLIENT_SECRET : アプリポータルで発行した Client Secret
-//   SCOPE         : mfc/accounting/offices.read mfc/accounting/journal.read mfc/accounting/accounts.read
+//   SCOPE         : mfc/accounting/offices.read mfc/accounting/journal.read mfc/accounting/accounts.read mfc/accounting/report.read
 //
 // 【アプリポータル設定】
 //   リダイレクト URI: https://script.google.com/macros/d/【スクリプトID】/usercallback
@@ -39,9 +40,10 @@ const MFC_TOKEN_URL     = 'https://api.biz.moneyforward.com/token';
 const MFC_API_BASE_URL  = 'https://api-accounting.moneyforward.com/api/v3';
 
 // シート名
-const OFFICE_SHEET_NAME   = '事業者情報';
-const ACCOUNTS_SHEET_NAME = '勘定科目マスタ';
-const JOURNAL_SHEET_NAME  = '仕訳データ';
+const OFFICE_SHEET_NAME      = '事業者情報';
+const ACCOUNTS_SHEET_NAME    = '勘定科目マスタ';
+const JOURNAL_SHEET_NAME     = '仕訳データ';
+const TRANSITION_PL_SHEET_NAME = '損益計算書_推移表';
 
 // ヘッダー行（openapi.yaml Office / AccountingPeriod スキーマより）
 const OFFICE_HEADER = [[
@@ -75,9 +77,10 @@ const JOURNAL_HEADER = [[
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('MFC会計連携')
-    .addItem('0. 事業者情報を確認',    'fetchAndWriteOfficeInfo')
-    .addItem('1. 勘定科目マスタを取得', 'fetchAndWriteAccounts')
-    .addItem('2. 仕訳データを取得',    'fetchAndWriteJournals')
+    .addItem('0. 事業者情報を確認',        'fetchAndWriteOfficeInfo')
+    .addItem('1. 勘定科目マスタを取得',     'fetchAndWriteAccounts')
+    .addItem('2. 仕訳データを取得',         'fetchAndWriteJournals')
+    .addItem('3. 損益計算書推移表を取得',   'fetchAndWriteTransitionPL')
     .addSeparator()
     .addItem('認証を実行',   'showAuthorizationUrl')
     .addItem('認証をリセット', 'reset')
@@ -620,4 +623,203 @@ function writeJournalsToSheet_(allJournals) {
     + `明細行数（branches展開後）: ${rows.length} 行`
   );
   Logger.log(`[WriteSheet] ${rows.length} 行を書き込みました。`);
+}
+
+
+// ============================================================
+// ⑨ 損益計算書推移表の取得と書き込み
+//    エンドポイント: GET /api/v3/reports/transition_pl
+//    スコープ      : mfc/accounting/report.read
+//    openapi.yaml  : TransitionResponse / TransitionRow / TransitionColumn スキーマ参照
+//
+//    【仕様まとめ（openapi.yaml より）】
+//    ・type=monthly 固定（現在は月次のみサポート）
+//    ・fiscal_year 省略時は最新会計年度を使用
+//    ・start_month / end_month 省略時は会計年度の開始月・終了月を使用
+//    ・金額がゼロの勘定科目・補助科目は返却されない
+//    ・未実現仕訳は含まれない
+//    ・常に全部門合計で集計される
+//
+//    【columns の仕様】
+//    ・月番号（'4'〜'3' 等、会計年度の月順）
+//    ・settlement_balance（決算残高）
+//    ・total（合計）
+//    ※ 返却される columns の順序・数は会計年度・期間設定により変動する
+//
+//    【rows のネスト構造】
+//    TransitionRow は再帰的にネストする。末端が type: 'account' の行が実データ。
+//      rows[]
+//        └─ type: 'financial_statement_item'  科目グループ（売上高合計 等）
+//             └─ rows[]
+//                  └─ type: 'account'         勘定科目（末端・valuesを持つ）
+//
+//    【出力シート設計】
+//    ・ヘッダー行をAPIレスポンスの columns から動的生成する（会計年度により列数が変わるため）
+//    ・行階層を「科目グループ名」「勘定科目名」の2列で表現する
+//    ・各月の金額を横に並べる（ピボット形式）
+//
+//    【マスタシートのパラメータ】
+//    ・C5 : 会計年度（例: 2025）　※ 空欄の場合は最新会計年度
+//    ・C6 : 集計開始月（例: 4）　 ※ 空欄の場合は会計年度の開始月
+//    ・C7 : 集計終了月（例: 3）　 ※ 空欄の場合は会計年度の終了月
+// ============================================================
+
+function fetchAndWriteTransitionPL() {
+  const service = getMoneyForwardAccountingService();
+  if (!service.hasAccess()) {
+    showAuthorizationUrl();
+    return;
+  }
+
+  // マスタシートからパラメータを取得
+  // 会計年度・月は任意（省略時はAPIデフォルト＝最新会計年度の全月）
+  let fiscalYear, startMonth, endMonth;
+  try {
+    const masterSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('マスタ');
+    if (!masterSheet) throw new Error('「マスタ」シートが見つかりません。');
+
+    const fyVal = masterSheet.getRange('C5').getValue();
+    fiscalYear  = fyVal ? String(parseInt(fyVal, 10)) : null;
+
+    const smVal = masterSheet.getRange('C6').getValue();
+    startMonth  = smVal ? String(parseInt(smVal, 10)) : null;
+
+    const emVal = masterSheet.getRange('C7').getValue();
+    endMonth    = emVal ? String(parseInt(emVal, 10)) : null;
+
+  } catch (e) {
+    SpreadsheetApp.getUi().alert(`パラメータ取得エラー: ${e.message}`);
+    return;
+  }
+
+  // クエリパラメータ組み立て
+  // type=monthly は必須（openapi.yaml: required, enum: ['monthly']）
+  let query = 'type=monthly';
+  if (fiscalYear) query += `&fiscal_year=${fiscalYear}`;
+  if (startMonth) query += `&start_month=${startMonth}`;
+  if (endMonth)   query += `&end_month=${endMonth}`;
+
+  const url = `${MFC_API_BASE_URL}/reports/transition_pl?${query}`;
+
+  Logger.log(`[TransitionPL] パラメータ: fiscal_year=${fiscalYear}, start_month=${startMonth}, end_month=${endMonth}`);
+
+  let result;
+  try {
+    result = fetchApi_(url, service.getAccessToken());
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('損益計算書推移表の取得に失敗しました。\n' + e.message);
+    return;
+  }
+
+  Logger.log('[TransitionPL] Response keys: ' + JSON.stringify(Object.keys(result)));
+  Logger.log('[TransitionPL] fiscal_year: '   + result.fiscal_year);
+  Logger.log('[TransitionPL] start_month: '   + result.start_month);
+  Logger.log('[TransitionPL] end_month: '     + result.end_month);
+  Logger.log('[TransitionPL] columns: '       + JSON.stringify(result.columns));
+
+  // openapi.yaml TransitionResponse スキーマ
+  const columns    = result.columns    || [];  // 月番号・settlement_balance・total 等
+  const rows_      = result.rows       || [];  // ネストした TransitionRow[]
+  const fiscalYearRes  = result.fiscal_year  || '';
+  const startMonthRes  = result.start_month  || '';
+  const endMonthRes    = result.end_month    || '';
+  const reportType     = result.report_type  || 'transition_pl';
+
+  if (columns.length === 0) {
+    SpreadsheetApp.getUi().alert('推移表データが取得できませんでした（columnsが空）。');
+    return;
+  }
+
+  // ──────────────────────────────────────────────────
+  // rows のフラット化
+  // ネスト構造を再帰的に展開し、末端（type: 'account'）の行のみ出力する
+  // 上位グループ名を breadcrumb として引き継ぐ
+  // ──────────────────────────────────────────────────
+  const flatRows = [];
+
+  function flattenRows_(rowList, parentName) {
+    if (!rowList) return;
+    for (const row of rowList) {
+      if (!row) continue;
+
+      if (row.type === 'account') {
+        // 末端行：実データとして追加
+        flatRows.push({
+          group:  parentName,    // 上位科目グループ名
+          name:   row.name || '',
+          values: row.values || [],
+          type:   row.type
+        });
+      } else {
+        // 中間グループ行：子 rows を再帰処理
+        // グループ自身の合計行も出力したい場合は以下のコメントを解除
+        // flatRows.push({ group: parentName, name: row.name || '', values: row.values || [], type: row.type });
+        flattenRows_(row.rows, row.name || parentName);
+      }
+    }
+  }
+
+  flattenRows_(rows_, '');
+
+  Logger.log(`[TransitionPL] フラット化後の行数: ${flatRows.length}`);
+
+  if (flatRows.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      '推移表データが見つかりませんでした。\n'
+      + '（金額がゼロの科目は返却されない仕様です）'
+    );
+    return;
+  }
+
+  // ──────────────────────────────────────────────────
+  // シートへの書き込み
+  // ヘッダー行: 固定列（科目グループ・勘定科目名）+ 動的列（columnsの各月）
+  // ──────────────────────────────────────────────────
+  const sheet = getOrCreateSheet_(TRANSITION_PL_SHEET_NAME);
+  sheet.clear();
+
+  // 列ラベルの日本語化マッピング
+  // openapi.yaml TransitionColumn enum より
+  const columnLabel = (col) => {
+    if (col === 'settlement_balance') return '決算残高';
+    if (col === 'total')              return '合計';
+    // 月番号はそのまま「X月」形式で表示
+    return col + '月';
+  };
+
+  // ヘッダー行を動的生成（固定2列 + columns分）
+  const headerRow = [
+    ['科目グループ', '勘定科目名', ...columns.map(columnLabel)]
+  ];
+  sheet.getRange(1, 1, 1, headerRow[0].length).setValues(headerRow);
+
+  // メタ情報を最上部に付記（1行目をメタ情報行として追加出力）
+  // シートの先頭に2行挿入してメタ情報を記載する
+  sheet.insertRowsBefore(1, 2);
+
+  sheet.getRange('A1').setValue(
+    `損益計算書 推移表 ／ FY${fiscalYearRes} ${startMonthRes}月〜${endMonthRes}月 ／ 取得日時: ${new Date().toLocaleString('ja-JP')}`
+  );
+  sheet.getRange('A1').setFontBold(true);
+  sheet.getRange('A2').setValue('（金額がゼロの科目は非表示。単位：円）');
+
+  // データ行（3行目以降）
+  const dataRows = flatRows.map(row => {
+    // values の各要素: null の場合は空文字、0 は 0 として出力（safeNum_ 使用）
+    const valuesCells = columns.map((_, i) => safeNum_(row.values[i]));
+    return [row.group, row.name, ...valuesCells];
+  });
+
+  if (dataRows.length > 0) {
+    // ヘッダーは3行目（insertRowsBefore後）
+    sheet.getRange(3, 1, 1, headerRow[0].length).setValues(headerRow);
+    sheet.getRange(4, 1, dataRows.length, dataRows[0].length).setValues(dataRows);
+  }
+
+  SpreadsheetApp.getUi().alert(
+    `損益計算書推移表を取得しました。\n`
+    + `会計年度: FY${fiscalYearRes}（${startMonthRes}月〜${endMonthRes}月）\n`
+    + `出力行数: ${dataRows.length} 行 ／ 列数: ${headerRow[0].length} 列`
+  );
+  Logger.log(`[TransitionPL] ${dataRows.length} 行 × ${headerRow[0].length} 列を書き込みました。`);
 }
