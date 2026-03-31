@@ -8,7 +8,7 @@
 //               - showAuthorizationUrl() をトリガー/手動の両コンテキストに対応
 //               - getMoneyForwardAccountingService() のプロパティ未設定時エラーをトリガー対応に修正
 //               - 各データ取得関数の完了通知をトリガー対応に修正
-//               - notifyAuthRequired_() を追加（トリガー実行時にメール通知）
+//               - notifyAuthRequired_() を追加（トリガー実行時にSlack Webhook通知）
 //               - manualAuthorize() を追加（初回認証用の手動実行専用関数）
 //             [2026-03-30] 会計期間をまたぐ日付範囲に対応（期間ごとにリクエスト分割）
 //                          勘定科目マスタ取得機能を追加
@@ -23,7 +23,7 @@
 //   CLIENT_ID     : アプリポータルで発行した Client ID
 //   CLIENT_SECRET : アプリポータルで発行した Client Secret
 //   SCOPE         : mfc/accounting/offices.read mfc/accounting/journal.read mfc/accounting/accounts.read mfc/accounting/report.read
-//   NOTIFY_EMAIL  : トリガー実行時に再認証通知を送るメールアドレス（任意。未設定時は実行ユーザーのアドレスを使用）
+//   SLACK_WEBHOOK_URL : Slack Incoming Webhook URL（トリガー実行時の再認証通知先）
 //
 // 【アプリポータル設定】
 //   リダイレクト URI: https://script.google.com/macros/d/【スクリプトID】/usercallback
@@ -39,7 +39,7 @@
 // 【トリガー運用フロー】
 //   ① スプレッドシートから manualAuthorize() を手動実行して初回認証を完了する
 //   ② 時間主導型トリガーに fetchAndWriteJournals() 等を設定する
-//   ③ トークン期限切れ時はメール通知が届くので、再度 manualAuthorize() を実行する
+//   ③ トークン期限切れ時はSlack通知が届くので、再度 manualAuthorize() を実行する
 // ============================================================
 
 
@@ -171,7 +171,7 @@ function manualAuthorize() {
 /**
  * 認証URLを表示またはメール通知する（手動/トリガー両対応）
  * - 手動実行時 : モーダルダイアログで認証URLを表示
- * - トリガー実行時 : メールで認証URLを通知して処理を中断させる
+ * - トリガー実行時 : Slack Incoming Webhookで認証URLを通知して処理を中断させる
  *
  * @param {Object} service - OAuth2サービスオブジェクト
  * @returns {boolean} UIコンテキストが有効だった場合 true
@@ -199,54 +199,106 @@ function showAuthorizationUrl(service) {
 
   } catch (uiErr) {
     // トリガー実行時はここに落ちる → メール通知に切り替え
-    Logger.log('[Auth] UIコンテキストなし。メール通知に切り替えます。');
+    Logger.log('[Auth] UIコンテキストなし。Slack通知に切り替えます。');
     notifyAuthRequired_(authorizationUrl);
     return false;
   }
 }
 
 /**
- * トリガー実行時に認証URLをメールで通知する
+ * トリガー実行時に認証URLをSlack Incoming Webhookで通知する
  * @param {string} authorizationUrl - 認証URL
  */
 function notifyAuthRequired_(authorizationUrl) {
-  // NOTIFY_EMAIL プロパティ優先、なければ実行ユーザーのメールアドレスを使用
-  const props     = PropertiesService.getScriptProperties();
-  const recipient = props.getProperty('NOTIFY_EMAIL') || Session.getActiveUser().getEmail();
+  const props      = PropertiesService.getScriptProperties();
+  const webhookUrl = props.getProperty('SLACK_WEBHOOK_URL');
 
-  if (!recipient) {
-    Logger.log('[Auth] 通知先メールアドレスを取得できませんでした。手動で認証を実行してください。');
+  if (!webhookUrl) {
+    Logger.log('[Auth] SLACK_WEBHOOK_URL が未設定です。スクリプトプロパティを確認してください。');
     Logger.log('[Auth] 認証URL: ' + authorizationUrl);
     return;
   }
 
+  const message = {
+    text: '⚠️ *【要対応】MFC会計 GAS連携：再認証が必要です*',
+    blocks: [
+      {
+        type: 'header',
+        text: {
+          type: 'plain_text',
+          text: '⚠️ MFC会計 GAS連携：再認証が必要です',
+          emoji: true
+        }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: 'トリガー実行時にアクセストークンが無効または未取得のため、処理を中断しました。\n以下の手順で再認証を行ってください。'
+        }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*再認証手順：*\n1. 下のボタンから認証URLを開く\n2. マネーフォワードにログインして「許可する」をクリック\n3. 「認証に成功しました」と表示されたらタブを閉じる\n4. 次回トリガー実行から自動再開されます'
+        }
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: {
+              type: 'plain_text',
+              text: '🔑 認証URLを開く',
+              emoji: true
+            },
+            url: authorizationUrl,
+            style: 'primary'
+          }
+        ]
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `送信日時: ${new Date().toLocaleString('ja-JP')} ／ Growth Farm合同会社 GAS自動実行`
+          }
+        ]
+      }
+    ]
+  };
+
   try {
-    MailApp.sendEmail({
-      to: recipient,
-      subject: '【要対応】MFC会計 GAS連携：再認証が必要です',
-      body: [
-        'MFC会計との連携で再認証が必要になりました。',
-        '',
-        '以下のURLをブラウザで開いて認証を完了してください：',
-        '',
-        authorizationUrl,
-        '',
-        '認証完了後、次回のトリガー実行から自動的に再開されます。',
-        '',
-        '認証手順：',
-        '1. 上記URLをブラウザで開く',
-        '2. マネーフォワードのログイン画面でログインする',
-        '3. アクセス許可画面で「許可する」をクリックする',
-        '4. 「認証に成功しました」と表示されたらタブを閉じる',
-        '',
-        '※ このメールはGrowth Farm合同会社のGAS自動実行から送信されています。'
-      ].join('\n')
+    const response = UrlFetchApp.fetch(webhookUrl, {
+      method: 'POST',
+      contentType: 'application/json',
+      payload: JSON.stringify(message),
+      muteHttpExceptions: true
     });
-    Logger.log('[Auth] 再認証通知メールを送信しました。宛先: ' + recipient);
-  } catch (mailErr) {
-    Logger.log('[Auth] メール送信に失敗しました: ' + mailErr.toString());
+
+    const responseCode = response.getResponseCode();
+    if (responseCode === 200) {
+      Logger.log('[Auth] Slack通知を送信しました。');
+    } else {
+      Logger.log('[Auth] Slack通知に失敗しました。HTTPステータス: ' + responseCode);
+      Logger.log('[Auth] レスポンス: ' + response.getContentText());
+      Logger.log('[Auth] 認証URL: ' + authorizationUrl);
+    }
+  } catch (e) {
+    Logger.log('[Auth] Slack通知の送信中にエラーが発生しました: ' + e.toString());
     Logger.log('[Auth] 認証URL: ' + authorizationUrl);
   }
+}
+
+/**
+ * Slack通知の動作確認用テスト関数（手動実行専用）
+ * GASエディタからこの関数を実行してSlackに通知が届くか確認する
+ */
+function testSlackNotify() {
+  notifyAuthRequired_('https://example.com/test-auth-url');
 }
 
 /**
