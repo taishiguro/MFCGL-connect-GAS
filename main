@@ -749,7 +749,7 @@ function fetchAndWriteTransitionPL() {
   sheet.getRange('A1').setValue(
     `損益計算書 推移表 ／ FY${fiscalYearRes} ${startMonthRes}月〜${endMonthRes}月 ／ 取得日時: ${new Date().toLocaleString('ja-JP')}`
   );
-  sheet.getRange('A1').setFontBold(true);
+  sheet.getRange('A1').setFontWeight('bold');
   sheet.getRange('A2').setValue('（金額がゼロの科目は非表示。単位：円）');
 
   // データ行（4行目以降）
